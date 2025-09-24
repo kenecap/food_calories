@@ -2,100 +2,74 @@
 
 import torch
 from torch.utils.data import Dataset
-from torchvision import transforms
 import pandas as pd
 import os
 from PIL import Image
+import numpy as np
+import timm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+def get_transforms(config, split='train'):
+    # Получаем конфиг модели из timm, чтобы знать размеры картинок, mean и std
+    image_cfg = timm.get_pretrained_cfg(config.IMAGE_MODEL_NAME)
+    input_size = image_cfg.input_size[1:]
+    mean = image_cfg.mean
+    std = image_cfg.std
+
+    if split == 'train':
+        # Мощные аугментации для обучающей выборки из вашего примера
+        return A.Compose([
+            A.SmallestMaxSize(max_size=max(input_size), p=1.0),
+            A.RandomCrop(height=input_size[0], width=input_size[1], p=1.0),
+            A.Affine(scale=(0.8, 1.2), rotate=(-15, 15), translate_percent=(-0.1, 0.1), shear=(-10, 10), p=0.7),
+            A.CoarseDropout(max_holes=8, max_height=int(0.1 * input_size[0]), max_width=int(0.1 * input_size[1]), p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.7),
+            A.Normalize(mean=mean, std=std),
+            ToTensorV2(),
+        ])
+    else:
+        # Простые трансформации для валидации/теста
+        return A.Compose([
+            A.Resize(height=input_size[0], width=input_size[1]),
+            A.Normalize(mean=mean, std=std),
+            ToTensorV2(),
+        ])
 
 class FoodDataset(Dataset):
-    """
-    Класс для загрузки и подготовки данных о блюдах.
-    Он умеет по индексу (idx) отдавать картинку, информацию об ингредиентах, массу и калорийность.
-    """
-    def __init__(self, data_dir, split='train'):
-        """
-        Конструктор класса. Здесь мы готовим данные.
-        Args:
-            data_dir (str): Путь к папке data.
-            split (str): 'train' или 'test' для выбора нужной части данных.
-        """
-        # 1. Загружаем CSV файлы
-        dish_df_path = os.path.join(data_dir, 'dish.csv')
-        ingr_df_path = os.path.join(data_dir, 'ingredients.csv')
+    def __init__(self, config, split='train'):
+        dish_df_path = os.path.join(config.DATA_DIR, 'dish.csv')
+        ingr_df_path = os.path.join(config.DATA_DIR, 'ingredients.csv')
         df_dish = pd.read_csv(dish_df_path)
         df_ingredients = pd.read_csv(ingr_df_path)
 
-        # 2. Оставляем только ту часть данных, которая нам нужна (train или test)
         self.data = df_dish[df_dish['split'] == split].reset_index(drop=True)
-        self.images_dir = os.path.join(data_dir, 'images')
-
-        # 3. Подготавливаем ингредиенты:
-        #    Создаем словарь, который сопоставляет ID ингредиента с его числовым индексом (от 1 до N)
-        #    Индекс 0 мы зарезервируем для "пустого" ингредиента (padding)
+        self.images_dir = os.path.join(config.DATA_DIR, 'images')
+        
         self.ingr_to_idx = {ingr_id: i + 1 for i, ingr_id in enumerate(df_ingredients['id'])}
-        # Сохраняем общее количество уникальных ингредиентов (+1 для padding)
         self.num_ingredients = len(self.ingr_to_idx) + 1
-
-        # 4. Определяем трансформации для изображений
-        #    Для обучающей выборки мы будем применять аугментацию (случайные изменения),
-        #    чтобы модель лучше обобщалась.
-        if split == 'train':
-            self.transform = transforms.Compose([
-                transforms.Resize((256, 256)),      # Изменяем размер до 256x256
-                transforms.RandomCrop(224),         # Случайно вырезаем квадрат 224x224
-                transforms.RandomHorizontalFlip(),  # Случайно отражаем по горизонтали
-                transforms.ToTensor(),              # Преобразуем картинку в тензор PyTorch
-                # Нормализуем тензор (стандартные значения для моделей, обученных на ImageNet)
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-        else: # Для тестовой выборки аугментация не нужна
-            self.transform = transforms.Compose([
-                transforms.Resize((224, 224)),      # Просто изменяем размер до 224x224
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
+        
+        self.transforms = get_transforms(config, split)
 
     def __len__(self):
-        """Этот метод должен возвращать общее количество примеров в датасете."""
         return len(self.data)
 
     def __getitem__(self, idx):
-        """
-        Этот метод получает на вход индекс (idx) и возвращает один пример данных.
-        PyTorch DataLoader будет автоматически вызывать его для формирования батчей.
-        """
-        # 1. Получаем строку с данными по индексу
         row = self.data.iloc[idx]
-
-        # 2. Работа с изображением
+        
+        # Обработка изображения с Albumentations
         dish_id = row['dish_id']
         image_path = os.path.join(self.images_dir, dish_id, 'rgb.png')
-        image = Image.open(image_path).convert('RGB') # Открываем картинку и убеждаемся, что она в формате RGB
-        image_tensor = self.transform(image) # Применяем трансформации
+        image = Image.open(image_path).convert('RGB')
+        image_tensor = self.transforms(image=np.array(image))['image']
 
-        # 3. Работа с ингредиентами
+        # Обработка ингредиентов (остается прежней, но с исправлением KeyError)
         ingredients_str = row['ingredients']
-        
-        # --- ИСПРАВЛЕНИЕ ОШИБКИ `KeyError` ---
-        # Превращаем строку 'id1;id2;...' в список числовых индексов [idx1, idx2, ...],
-        # при этом проверяем, есть ли такой ингредиент в нашем словаре.
-        # Если его нет - мы его просто пропускаем.
-        ingr_indices = [
-            self.ingr_to_idx[ingr_id] 
-            for ingr_id in ingredients_str.split(';') 
-            if ingr_id in self.ingr_to_idx
-        ]
-
-        # На случай, если после фильтрации не осталось ни одного известного ингредиента,
-        # мы создадим тензор с одним "пустым" элементом (0), чтобы избежать ошибки.
+        ingr_indices = [self.ingr_to_idx[ingr_id] for ingr_id in ingredients_str.split(';') if ingr_id in self.ingr_to_idx]
         if not ingr_indices:
             ingr_indices = [0]
-            
         ingr_tensor = torch.LongTensor(ingr_indices)
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
-
-        # 4. Получаем остальные данные и превращаем их в тензоры
         mass = torch.tensor(row['total_mass'], dtype=torch.float32)
         calories = torch.tensor(row['total_calories'], dtype=torch.float32)
 
@@ -106,23 +80,13 @@ class FoodDataset(Dataset):
             'calories': calories
         }
 
+# collate_fn остается прежним
 def collate_fn(batch):
-    """
-    Специальная функция для обработки батча.
-    Её задача - "выровнять" списки ингредиентов, так как в разных блюдах их разное количество.
-    Она добавляет 0 (padding) в конец коротких списков, чтобы все они стали одной длины.
-    """
-    # Разделяем данные из батча по типам
     images = torch.stack([item['image'] for item in batch])
-    masses = torch.stack([item['mass'] for item in batch]).unsqueeze(1) # Добавляем размерность для конкатенации
+    masses = torch.stack([item['mass'] for item in batch]).unsqueeze(1)
     calories = torch.stack([item['calories'] for item in batch]).unsqueeze(1)
-    
-    # "Выравнивание" ингредиентов
     ingredients_list = [item['ingredients'] for item in batch]
-    # Используем встроенную функцию PyTorch для "выравнивания"
-    # batch_first=True означает, что размер батча будет первой размерностью
     ingredients_padded = torch.nn.utils.rnn.pad_sequence(ingredients_list, batch_first=True, padding_value=0)
-    
     return {
         'image': images,
         'ingredients': ingredients_padded,

@@ -2,48 +2,52 @@
 
 import torch
 import torch.nn as nn
-import torchvision.models as models
+import timm
 
 class CaloriePredictor(nn.Module):
-    def __init__(self, num_ingredients, embedding_dim=128):
+    def __init__(self, config, num_ingredients):
         super().__init__()
 
-        # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: ИСПОЛЬЗУЕМ БОЛЕЕ МОЩНУЮ МОДЕЛЬ ---
-        self.image_branch = models.resnet50(pretrained=True)
-        # --------------------------------------------------------
+        # --- ИСПОЛЬЗУЕМ TIMM ДЛЯ СОЗДАНИЯ EFFICIENTNET ---
+        # num_classes=0 означает, что мы хотим получить модель без классификационной "головы"
+        self.image_model = timm.create_model(
+            config.IMAGE_MODEL_NAME,
+            pretrained=True,
+            num_classes=0  
+        )
         
-        # Оставляем полную заморозку - это самая стабильная стратегия
-        for param in self.image_branch.parameters():
-            param.requires_grad = False
+        # Получаем количество признаков на выходе из EfficientNet
+        num_image_features = self.image_model.num_features
 
-        # Этот код сработает без изменений, т.к. у ResNet50 тоже есть .fc слой
-        num_features = self.image_branch.fc.in_features
-        self.image_branch.fc = nn.Linear(num_features, 256)
-
-        # Остальная часть модели остается прежней
+        # --- Ветвь для ингредиентов и массы (без изменений) ---
         self.ingredient_embedding = nn.Embedding(
             num_embeddings=num_ingredients, 
-            embedding_dim=embedding_dim, 
+            embedding_dim=config.EMBEDDING_DIM, 
             padding_idx=0
         )
         self.text_branch = nn.Sequential(
-            nn.Linear(embedding_dim + 1, 128),
+            nn.Linear(config.EMBEDDING_DIM + 1, 128),
             nn.ReLU(),
             nn.Linear(128, 256)
         )
+
+        # --- "Голова", которая объединяет все и делает предсказание ---
+        # Теперь она принимает на вход признаки от EfficientNet
         self.fusion_head = nn.Sequential(
-            nn.Linear(256 + 256, 128),
+            nn.Linear(num_image_features + 256, 512),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, 1)
+            nn.Linear(512, 1)
         )
 
     def forward(self, image, ingredients, mass):
-        image_features = self.image_branch(image)
+        image_features = self.image_model(image)
+        
         embedded_ingredients = self.ingredient_embedding(ingredients)
         mean_ingredients = embedded_ingredients.mean(dim=1)
         text_input = torch.cat([mean_ingredients, mass], dim=1)
         text_features = self.text_branch(text_input)
+
         combined_features = torch.cat([image_features, text_features], dim=1)
         prediction = self.fusion_head(combined_features)
         return prediction

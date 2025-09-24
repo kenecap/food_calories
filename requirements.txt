@@ -7,3 +7,6 @@ tqdm
 numpy
 torch
 torchvision
+timm
+albumentations
+opencv-python-headless

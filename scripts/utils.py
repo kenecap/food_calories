@@ -3,9 +3,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-# --- ИЗМЕНЕНИЕ 1: Импортируем планировщик ---
 from torch.optim.lr_scheduler import StepLR
-# -------------------------------------------
 import random
 import numpy as np
 from tqdm import tqdm
@@ -14,7 +12,6 @@ from scripts.dataset import FoodDataset, collate_fn
 from scripts.model import CaloriePredictor
 
 def set_seed(seed):
-    # ... функция set_seed без изменений ...
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -25,35 +22,54 @@ def train_model(config):
     set_seed(config.SEED)
     print(f"Обучение будет на устройстве: {config.DEVICE}")
 
-    # --- Подготовка данных (без изменений) ---
-    train_dataset = FoodDataset(data_dir=config.DATA_DIR, split='train')
-    test_dataset = FoodDataset(data_dir=config.DATA_DIR, split='test')
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    # --- Подготовка данных ---
+    train_dataset = FoodDataset(config, split='train')
+    test_dataset = FoodDataset(config, split='test')
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False, collate_fn=collate_fn, num_workers=2)
 
-    # --- Инициализация модели (без изменений) ---
-    model = CaloriePredictor(num_ingredients=train_dataset.num_ingredients, embedding_dim=config.EMBEDDING_DIM).to(config.DEVICE)
+    # --- Инициализация модели ---
+    model = CaloriePredictor(config, num_ingredients=train_dataset.num_ingredients).to(config.DEVICE)
 
-    # --- Настройка обучения ---
-    loss_fn = nn.MSELoss()
-    # Возвращаем простой оптимизатор без weight_decay
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    # --- Настройка Fine-tuning и Оптимизатора ---
+    # 1. Замораживаем всю image_model
+    for param in model.image_model.parameters():
+        param.requires_grad = False
+        
+    # 2. Размораживаем последние несколько блоков EfficientNet
+    # Для efficientnet_b0 это блоки 5 и 6, а также head
+    for param in model.image_model.blocks[5].parameters():
+        param.requires_grad = True
+    for param in model.image_model.blocks[6].parameters():
+        param.requires_grad = True
+    for param in model.image_model.conv_head.parameters():
+        param.requires_grad = True
+    for param in model.image_model.bn2.parameters():
+        param.requires_grad = True
     
-    # --- ИЗМЕНЕНИЕ 2: Создаем планировщик ---
-    # Каждые 7 эпох (step_size=7) он будет умножать скорость обучения на 0.1 (gamma=0.1)
-    scheduler = StepLR(optimizer, step_size=7, gamma=0.1)
-    # ---------------------------------------
-
+    # 3. Создаем группы параметров с разными LR
+    image_params = [p for p in model.image_model.parameters() if p.requires_grad]
+    head_params = list(model.ingredient_embedding.parameters()) + \
+                  list(model.text_branch.parameters()) + \
+                  list(model.fusion_head.parameters())
+                  
+    optimizer = torch.optim.AdamW([
+        {'params': image_params, 'lr': config.IMAGE_LR},
+        {'params': head_params, 'lr': config.HEAD_LR}
+    ])
+    
+    loss_fn = nn.MSELoss()
+    scheduler = StepLR(optimizer, step_size=8, gamma=0.1)
+    
     best_mae = float('inf')
 
+    # --- Цикл обучения (остается почти без изменений) ---
     for epoch in range(config.EPOCHS):
         print(f"\n--- Эпоха {epoch + 1} / {config.EPOCHS} ---")
         
         model.train()
-        # ... цикл обучения без изменений ...
         train_mae = 0
         for batch in tqdm(train_loader, desc="Обучение"):
-            # ... (forward, loss, backward, step) ...
             images, ingredients, mass, calories = (batch['image'].to(config.DEVICE), batch['ingredients'].to(config.DEVICE), batch['mass'].to(config.DEVICE), batch['calories'].to(config.DEVICE))
             predictions = model(images, ingredients, mass)
             loss = loss_fn(predictions, calories)
@@ -64,7 +80,6 @@ def train_model(config):
             
         print(f"Средняя MAE на обучении: {train_mae / len(train_loader):.2f}")
 
-        # ... цикл оценки без изменений ...
         model.eval()
         val_mae = 0
         with torch.no_grad():
@@ -81,9 +96,7 @@ def train_model(config):
             torch.save(model.state_dict(), config.MODEL_SAVE_PATH)
             print(f"✨ Новая лучшая модель сохранена! MAE = {best_mae:.2f}")
 
-        # --- ИЗМЕНЕНИЕ 3: Делаем шаг планировщика в конце эпохи ---
         scheduler.step()
-        # -----------------------------------------------------------
 
     print("\nОбучение завершено!")
     print(f"Лучший результат MAE на тесте: {best_mae:.2f}")
